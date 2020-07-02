@@ -4,63 +4,109 @@ cache:
   directories:
     - $HOME/.ghc
     - $HOME/.stack
-matrix:
+jobs:
   include:
-  - sudo: false
-    dist: trusty
+  - dist: bionic
     addons:
       apt:
         packages:
-          - ghc-8.0.2
+          - ghc-8.10.1
         sources:
           - hvr-ghc
+  - os: linux
+    arch: arm64
+    dist: bionic
+    addons:
+      apt:
+        packages:
+          - ghc
+          - cabal-install
   - os: osx
+  allow_failures:
+  - arch: arm64
 before_install:
   # pandoc-nightly version
   - |
-    printf "%s: %s\n" "pandoc-nightly version" "0.2.2"
+    printf "%s: %s\n" "pandoc-nightly version" "0.3"
 install:
   # Download and unpack the stack executable
-  - mkdir -p ~/.local/bin
+  - mkdir -p ~/.local/bin && export PATH="$HOME/.local/bin:$PATH"
+  - mkdir -p ~/temp && cd ~/temp
   - |
-    if [[ `uname` = "Darwin" ]]; then
-      curl --insecure -L https://www.stackage.org/stack/osx-x86_64 | tar xz --strip-components=1 --include '*/stack' -C ~/.local/bin
+    if [[ "$TRAVIS_OS_NAME" == osx || "$TRAVIS_CPU_ARCH" == amd64 ]]; then
+      wget -q "https://www.stackage.org/stack/${TRAVIS_OS_NAME}-x86_64"
+      tar -xf "${TRAVIS_OS_NAME}-x86_64"
+      mv stack-*-${TRAVIS_OS_NAME}-x86_64/stack ~/.local/bin
     else
-      curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards --strip-components=1 -C ~/.local/bin '*/stack'
+      echo skip installing stack for arm64
     fi
-  - export PATH=$PATH:$HOME/.local/bin
+  - |
+    if [[ "$TRAVIS_OS_NAME" == osx ]]; then
+      wget -q 'https://downloads.haskell.org/~ghc/8.10.1/ghc-8.10.1-x86_64-apple-darwin.tar.xz'
+      tar -xf ghc-8.10.1-x86_64-apple-darwin.tar.xz
+      cd ghc-8.10.1
+      ./configure --prefix="$HOME/.local"
+      make install
+    else
+      echo skip installing cabal if not osx
+    fi
 before_script:
   # clone from git
-  - git clone https://github.com/jgm/pandoc
+  - mkdir ~/git
+  - cd ~/git
+  - git clone --depth 1 https://github.com/jgm/pandoc --branch master --single-branch
   - cd pandoc
-  - git submodule update --init
+  - git submodule update --init --recommend-shallow
   # get the current commit hash of pandoc
   - HASH=$(git rev-parse --short HEAD)
   # filename
   - |
-    if [[ `uname` == "Darwin" ]]; then
-      filename=pandoc-osx-$HASH
-    else
-      filename=pandoc-amd64-$HASH
-    fi
+    case "$TRAVIS_OS_NAME" in
+      osx)   filename=pandoc-osx-$HASH                  ;;
+      linux) filename="pandoc-${TRAVIS_CPU_ARCH}-$HASH" ;;
+      *)     exit 1                                     ;;
+    esac
 script:
   # build
-  - stack setup
-  - stack build --flag 'pandoc:embed_data_files'
-  - cd ..
-  # path to the pandoc executable
-  - path2pandoc="$(find pandoc/.stack-work/install -type f -iname 'pandoc')"
+  - |
+    if [[ "$TRAVIS_OS_NAME" == osx || "$TRAVIS_CPU_ARCH" == amd64 ]]; then
+      stack setup
+      stack build --flag 'pandoc:embed_data_files'
+      cd ..
+      # path to the pandoc executable
+      path2pandoc="$(find pandoc/.stack-work/install -type f -name pandoc)"
+    else
+      cabal update
+      cabal --version
+      cabal install cabal-install
+      cabal install --only-dependencies
+      cabal configure --flags="embed_data_files https"
+      cabal build
+      cabal install
+      path2pandoc="$CABALDIR/bin/pandoc"
+    fi
   # debug
-  - $path2pandoc -v
+  - ls -aglh "$path2pandoc"
+  - |
+    "$path2pandoc" -v
 after_success:
   # if it's a cron job, create git tag for GitHub Releases, only on Linux build
   - |
-    if [[ $TRAVIS_EVENT_TYPE == 'cron' && `uname` != "Darwin" ]]; then
+    if [[ "$TRAVIS_EVENT_TYPE" == cron && "$TRAVIS_OS_NAME" == linux ]]; then
       git config --global user.email "builds@travis-ci.com"
       git config --global user.name "Travis CI"
       export GIT_TAG="hash-$HASH"
-      git tag $GIT_TAG -a -m "Generated tag from TravisCI build $TRAVIS_BUILD_NUMBER"
-      git push --quiet https://$GH_TOKEN_SECURE@github.com/pandoc-extras/pandoc-nightly $GIT_TAG > /dev/null 2>&1
+      git tag "$GIT_TAG" -a -m "Generated tag from TravisCI build $TRAVIS_BUILD_NUMBER"
+      git push --quiet https://$GH_TOKEN_SECURE@github.com/pandoc-extras/pandoc-nightly "$GIT_TAG" > /dev/null 2>&1
+    fi
+  # if it's a cron job, remove Draft releases on GitHub, only on macOS build
+  # These Draft releases exists when there's a broken release from Travis
+  - |
+    if [[ $TRAVIS_EVENT_TYPE == 'cron' && "$TRAVIS_OS_NAME" == osx ]]; then
+      brew update
+      brew outdated hub || brew upgrade hub
+      # hub expect the env var GITHUB_TOKEN and I'm too lazy to rename the one I added on Travis
+      GITHUB_TOKEN="$GH_TOKEN_SECURE" hub release -f "%T (%S) %n" --include-drafts | grep " (draft)" | awk '{print $1}' | xargs -t -n1 hub release delete || :
     fi
   # zip pandoc binary and move to dist/ if it is the git-tag build (GitHub Releases)
   - |
@@ -71,21 +117,13 @@ after_success:
       mkdir -p dist
       mv $filename.zip dist/
     fi
-  # download Windows' nightly from appveyor if it is the git-tag build (GitHub Releases), only on Linux build
-  - |
-    if [[ ! -z "$TRAVIS_TAG" && `uname` != "Darwin" ]]; then
-      mkdir -p dist
-      wget 'https://ci.appveyor.com/api/projects/jgm/pandoc/artifacts/windows/pandoc-windows-i386.msi?branch=master' -O dist/pandoc-windows-$HASH.msi
-      wget 'https://ci.appveyor.com/api/projects/jgm/pandoc/artifacts/windows/pandoc-windows-i386.zip?branch=master' -O dist/pandoc-windows-$HASH.zip
-    fi
   # debug
   - ls -l dist/
 deploy:
   provider: releases
-  api_key: "$GH_TOKEN_SECURE"
+  token: "$GH_TOKEN_SECURE"
   file_glob: true
   file: "dist/*"
-  skip_cleanup: true
   on:
     tags: true
 env:
